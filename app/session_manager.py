@@ -1,62 +1,107 @@
-import uuid
-from datetime import datetime
-from typing import Dict, List
+import time
+from collections import defaultdict
+from dataclasses import dataclass, field
+from typing import List
 
+@dataclass
+class ViolationEvent:
+    timestamp: float
+    zone: str
+    frame_index: int
+
+@dataclass
+class ExamSession:
+    session_id: str
+    user_id: str
+    quiz_id: str
+    started_at: float = field(default_factory=time.time)
+    total_frames: int = 0
+    violation_frames: int = 0
+    violations: List[ViolationEvent] = field(default_factory=list)
+    consecutive_violation_count: int = 0
+    cooldown_remaining: int = 0
+
+    @property
+    def violation_rate(self) -> float:
+        if self.total_frames == 0:
+            return 0.0
+        return self.violation_frames / self.total_frames
+
+    def to_summary(self) -> dict:
+        return {
+            "session_id": self.session_id,
+            "user_id": self.user_id,
+            "quiz_id": self.quiz_id,
+            "duration_seconds": time.time() - self.started_at,
+            "total_frames_analyzed": self.total_frames,
+            "violation_frames": self.violation_frames,
+            "violation_rate": round(self.violation_rate, 4),
+            "violation_count": len(self.violations),
+            "violations": [
+                {"timestamp": v.timestamp, "zone": v.zone, "frame": v.frame_index}
+                for v in self.violations[-50:]  # Last 50 violations max
+            ]
+        }
 
 class SessionManager:
-    """
-    Manages per-exam proctoring sessions in memory.
-    Each session tracks its metadata and a log of gaze events.
-
-    Note: For production, replace the in-memory store with a
-    persistent backend (e.g. Redis, PostgreSQL).
-    """
-
     def __init__(self):
-        self._sessions: Dict[str, dict] = {}
+        self._sessions: dict[str, ExamSession] = {}
 
-    def start_session(self, exam_id: str, student_id: str) -> str:
-        """Create a new proctoring session and return its ID."""
-        session_id = str(uuid.uuid4())
-        self._sessions[session_id] = {
-            "session_id": session_id,
-            "exam_id": exam_id,
-            "student_id": student_id,
-            "started_at": datetime.utcnow().isoformat(),
-            "ended_at": None,
-            "events": [],
-        }
-        return session_id
+    def create_session(self, session_id: str, user_id: str, quiz_id: str) -> ExamSession:
+        session = ExamSession(session_id=session_id, user_id=user_id, quiz_id=quiz_id)
+        self._sessions[session_id] = session
+        return session
 
-    def end_session(self, session_id: str) -> dict:
-        """Mark a session as ended and return a summary."""
-        session = self._get_session(session_id)
-        session["ended_at"] = datetime.utcnow().isoformat()
+    def get_session(self, session_id: str) -> ExamSession | None:
+        return self._sessions.get(session_id)
 
-        events: List[dict] = session["events"]
-        suspicious_count = sum(1 for e in events if e.get("is_suspicious"))
+    def end_session(self, session_id: str) -> dict | None:
+        session = self._sessions.pop(session_id, None)
+        if session:
+            return session.to_summary()
+        return None
 
-        return {
-            "total_frames": len(events),
-            "suspicious_frames": suspicious_count,
-            "started_at": session["started_at"],
-            "ended_at": session["ended_at"],
-        }
+    def record_frame(self, session_id: str, gaze_result, config) -> dict:
+        session = self._sessions.get(session_id)
+        if not session:
+            return {"error": "Session not found"}
 
-    def record_event(self, session_id: str, event: dict) -> None:
-        """Append a gaze analysis event to the session log."""
-        session = self._get_session(session_id)
-        session["events"].append(event)
+        session.total_frames += 1
 
-    def get_session(self, session_id: str) -> dict:
-        """Return the full session object."""
-        return self._get_session(session_id)
+        if session.cooldown_remaining > 0:
+            session.cooldown_remaining -= 1
 
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
+        if gaze_result.is_violation:
+            session.violation_frames += 1
+            session.consecutive_violation_count += 1
 
-    def _get_session(self, session_id: str) -> dict:
-        if session_id not in self._sessions:
-            raise KeyError(f"Session '{session_id}' not found.")
-        return self._sessions[session_id]
+            should_alert = (
+                session.consecutive_violation_count >= config.VIOLATION_FRAME_THRESHOLD
+                and session.cooldown_remaining == 0
+            )
+            if should_alert:
+                event = ViolationEvent(
+                    timestamp=time.time(),
+                    zone=gaze_result.zone.value,
+                    frame_index=session.total_frames
+                )
+                session.violations.append(event)
+                session.cooldown_remaining = config.VIOLATION_COOLDOWN_FRAMES
+                session.consecutive_violation_count = 0
+
+            return {
+                "status": "VIOLATION",
+                "zone": gaze_result.zone.value,
+                "alert": should_alert,
+                "message": gaze_result.message,
+                "violation_rate": session.violation_rate
+            }
+        else:
+            session.consecutive_violation_count = 0
+            return {
+                "status": "OK",
+                "zone": gaze_result.zone.value,
+                "alert": False,
+                "message": gaze_result.message,
+                "violation_rate": session.violation_rate
+            }
